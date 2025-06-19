@@ -4,9 +4,10 @@ import requests
 from typing import Optional
 from constants import TOKEN_INFO_URL, TOKEN_URL
 import secrets
+from database import CACHE, User, TokenUpdate, DB
 
 
-def verify_token(access_token: str) -> bool:
+def verify_access_token(access_token: str) -> bool:
   """ Verify google access token."""
   try: response = requests.get(TOKEN_INFO_URL, params={'access_token': access_token}, timeout=10)
   except Exception as e:
@@ -74,3 +75,61 @@ def generate_crypto_string(length: int=32) -> str:
   required_bytes = (length * 6 + 7) // 8  # Calculate bytes needed for the desired length
   token = secrets.token_urlsafe(required_bytes)
   return token[:length]
+
+
+def auth_session(session_id: str, db: DB) -> bool:
+  """
+    Authenticates a user by verifying their access token and refreshing it if necessary.
+  """
+  try: user_id = CACHE.get(session_id)
+  except Exception as e:
+    print(f"Error fetching user id: {e}")
+    return False
+
+  try:  user = db.get(User, user_id)
+  except Exception as e:
+    print(f"Error fetching user data: {e}")
+    return False
+
+  if user is None:
+    print("User not found")
+    return False
+
+  # Verify access token
+  if not verify_access_token(user.access_token):
+    # If access token verification fails, try refreshing the token
+    try: refresh_token = user.refresh_token
+    except Exception as e:
+      print(f"Error fetching refresh token: {e}")
+      return False
+
+    if refresh_token is None:
+      print("No refresh token found")
+      return False
+
+    client_id = os.getenv("CLIENT_ID")
+    client_secret = os.getenv("CLIENT_SECRET")
+
+    if client_id is None: raise ValueError("Google signin client id not found")
+    if client_secret is None: raise ValueError("Google signin client secret not found")
+
+    new_access_token = refresh_access_token(str(refresh_token), client_id, client_secret)
+    if new_access_token is None:
+      print("Error refreshing access token")
+      return False
+
+    try: 
+      new_token = TokenUpdate(
+        access_token=new_access_token, 
+        refresh_token=None
+      )
+
+      user.sqlmodel_update(new_token.model_dump(exclude_unset=True))
+      db.add(user)
+      db.commit()
+      db.refresh(user)
+    except Exception as e:
+      print(f"Error setting new access token: {e}")
+      return False
+
+  return True

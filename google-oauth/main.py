@@ -1,26 +1,30 @@
-from fastapi import FastAPI, Request, Depends
+from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse, JSONResponse
 import uvicorn
 from dotenv import load_dotenv
 from fastapi.templating import Jinja2Templates
-from utils import auth_config, generate_crypto_string
+from utils import auth_config, generate_crypto_string, auth_session
 from datetime import datetime, timedelta, timezone
-from typing import Union, Dict, Any, Optional, Annotated
+from typing import Union, Dict, Any, Optional
 import os
 import requests
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 from constants import TOKEN_URL
-from sqlmodel import Session
-from db import get_session, User
+from contextlib import asynccontextmanager
+from database import get_session, User, create_db_and_tables, TokenUpdate, CACHE, DB
 
 load_dotenv()
 
-DB = Annotated[Session, Depends(get_session)]
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> Any:
+  create_db_and_tables()
+  yield
 
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 templates = Jinja2Templates(directory="templates")
+
 
 @app.get("/")
 async def index(request: Request):
@@ -28,10 +32,14 @@ async def index(request: Request):
 
 
 @app.get("/home")
-async def home(request: Request):
-	return templates.TemplateResponse(
-    request=request, name="home.html", context={"username": "John Doe"}
-  )
+async def home(request: Request, db: DB):
+  session_id = request.cookies.get("session_id")
+  if auth_session(session_id, db):
+    return templates.TemplateResponse(
+      request=request, name="home.html", context={}
+    )
+  else:
+    return RedirectResponse("/")
 
 
 @app.get("/sign-in")
@@ -139,10 +147,10 @@ async def callback(request: Request, db: DB) -> Union[JSONResponse, RedirectResp
   user = db.get(User, user_id)
   if user is None:
     user = User(
-       id=user_id,
-       name=username,
-       access_token=access_token,
-       refresh_token=refresh_token
+      id=user_id,
+      name=username,
+      access_token=access_token,
+      refresh_token=refresh_token
     )
     # Add user to database
     db.add(user)
@@ -150,7 +158,17 @@ async def callback(request: Request, db: DB) -> Union[JSONResponse, RedirectResp
     db.refresh(user)
   else:
     #  Update access token and refresh token
-    pass
+    new_token = TokenUpdate(
+      access_token=access_token, 
+      refresh_token=refresh_token
+    )
+
+    user.sqlmodel_update(new_token.model_dump(exclude_unset=True))
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+  CACHE.set(session_id, user_id)
 
   # Set user authentication cookie
   response = RedirectResponse(url="/home", status_code=302)
